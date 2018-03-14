@@ -19,7 +19,7 @@ import torch.nn.init as init
 import argparse
 from torch.autograd import Variable
 import torch.utils.data as data
-from data import v2, UCF24Detection, AnnotationTransform, detection_collate, CLASSES, BaseTransform
+from data import v2, UCF24Detection, AnnotationTransform, detection_collate, CLASSES, BaseTransform, readsplitfile
 from utils.augmentations import SSDAugmentation
 from layers.modules import MultiBoxLoss
 from ssd import build_ssd
@@ -29,6 +29,8 @@ from utils.evaluation import evaluate_detections
 from layers.box_utils import decode, nms
 from utils import  AverageMeter
 from torch.optim.lr_scheduler import MultiStepLR
+from torch.nn.utils import clip_grad_norm
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 def str2bool(v):
@@ -40,7 +42,7 @@ parser.add_argument('--version', default='v2', help='conv11_2(v2) or pool6(v1) a
 parser.add_argument('--basenet', default='vgg16_reducedfc.pth', help='pretrained base model')
 parser.add_argument('--dataset', default='ucf24', help='pretrained base model')
 parser.add_argument('--ssd_dim', default=300, type=int, help='Input Size for SSD') # only support 300 now
-parser.add_argument('--input_type', default='rgb', type=str, help='INput tyep default rgb options are [rgb,brox,fastOF]')
+parser.add_argument('--modality', default='rgb', type=str, help='INput tyep default rgb options are [rgb,brox,fastOF]')
 parser.add_argument('--jaccard_threshold', default=0.5, type=float, help='Min Jaccard index for matching')
 parser.add_argument('--batch_size', default=32, type=int, help='Batch size for training')
 parser.add_argument('--resume', default=None, type=str, help='Resume from checkpoint')
@@ -62,6 +64,7 @@ parser.add_argument('--iou_thresh', default=0.5, type=float, help='Evaluation th
 parser.add_argument('--conf_thresh', default=0.01, type=float, help='Confidence threshold for evaluation')
 parser.add_argument('--nms_thresh', default=0.45, type=float, help='NMS threshold')
 parser.add_argument('--topk', default=50, type=int, help='topk for evaluation')
+parser.add_argument('--clip_gradient', default=40, type=float, help='gradients clip')
 
 ## Parse arguments
 args = parser.parse_args()
@@ -88,7 +91,7 @@ def main():
 
     ## Define the experiment Name will used to same directory and ENV for visdom
     args.exp_name = 'CONV-SSD-{}-{}-bs-{}-{}-lr-{:05d}'.format(args.dataset,
-                args.input_type, args.batch_size, args.basenet[:-14], int(args.lr*100000))
+                args.modality, args.batch_size, args.basenet[:-14], int(args.lr*100000))
 
     args.save_root += args.dataset+'/'
     args.save_root = args.save_root+'cache/'+args.exp_name+'/'
@@ -112,11 +115,12 @@ def main():
 
     print('Initializing weights for extra layers and HEADs...')
     # initialize newly added layers' weights with xavier method
+    net.clstm.apply(weights_init)
     net.extras.apply(weights_init)
     net.loc.apply(weights_init)
     net.conf.apply(weights_init)
 
-    if args.input_type == 'fastOF':
+    if args.modality == 'fastOF':
         print('Download pretrained brox flow trained model weights and place them at:::=> ',args.data_root + 'ucf24/train_data/brox_wieghts.pth')
         pretrained_weights = args.data_root + 'ucf24/train_data/brox_wieghts.pth'
         print('Loading base network...')
@@ -162,13 +166,13 @@ def train(args, net, optimizer, criterion, scheduler):
     cls_losses = AverageMeter()
 
     print('Loading Dataset...')
-    train_dataset = UCF24Detection(args.data_root, args.train_sets, SSDAugmentation(args.ssd_dim, args.means),
-                                   AnnotationTransform(), input_type=args.input_type)
-    val_dataset = UCF24Detection(args.data_root, 'test', BaseTransform(args.ssd_dim, args.means),
-                                 AnnotationTransform(), input_type=args.input_type,
-                                 full_test=False)
-    epoch_size = len(train_dataset) // args.batch_size
-    print('Training SSD on', train_dataset.name)
+    # train_dataset = UCF24Detection(args.data_root, args.train_sets, SSDAugmentation(args.ssd_dim, args.means),
+    #                                AnnotationTransform(), input_type=args.input_type)
+    # val_dataset = UCF24Detection(args.data_root, 'test', BaseTransform(args.ssd_dim, args.means),
+    #                              AnnotationTransform(), input_type=args.input_type,
+    #                              full_test=False)
+    # epoch_size = len(train_dataset) // args.batch_size
+    # print('Training SSD on', train_dataset.name)
 
     if args.visdom:
 
@@ -204,35 +208,62 @@ def train(args, net, optimizer, criterion, scheduler):
 
 
     batch_iterator = None
-    train_data_loader = data.DataLoader(train_dataset, args.batch_size, num_workers=args.num_workers,
-                                  shuffle=False, collate_fn=detection_collate, pin_memory=True)
+    rootpath = args.data_root
+    imgtype = args.modality
+    imagesDir = rootpath + imgtype + '/'
+    split = 1
+    splitfile = rootpath + 'splitfiles/trainlist{:02d}.txt'.format(split)
+    trainvideos = readsplitfile(splitfile)
+
+    splitfile = rootpath + 'splitfiles/testlist{:02d}.txt'.format(split)
+    testvideos = readsplitfile(splitfile)
+
+    # train_data_loader = data.DataLoader(train_dataset, args.batch_size, num_workers=args.num_workers,
+    #                               shuffle=False, collate_fn=detection_collate, pin_memory=True)
+    # val_data_loader = data.DataLoader(val_dataset, args.batch_size, num_workers=args.num_workers,
+    #                              shuffle=False, collate_fn=detection_collate, pin_memory=True)
+    val_data_loader = []
+    len_test = len(testvideos)
+    random.shuffle(testvideos)
+    testvideos_temp = testvideos
+    val_dataset = UCF24Detection(args.data_root, 'test', BaseTransform(args.ssd_dim, args.means),
+                                 AnnotationTransform(), input_type=args.modality,
+                                 full_test=False,
+                                 videos=testvideos_temp,
+                                 istrain=False)
     val_data_loader = data.DataLoader(val_dataset, args.batch_size, num_workers=args.num_workers,
-                                 shuffle=False, collate_fn=detection_collate, pin_memory=True)
+                                           shuffle=False, collate_fn=detection_collate, pin_memory=True,
+                                           drop_last=True)
+
     itr_count = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     iteration = 0
 
-    train_shuffle = []
-    ii = len(train_data_loader)
-    ii = 0
-    for iteration in range(len(train_data_loader)):
-        # ii += 1
-        # print (ii)
-        # if ii > 20:
-        #     break
-        if not batch_iterator:
-            batch_iterator = iter(train_data_loader)
-        # load train data
-        images, targets, img_indexs = next(batch_iterator)
-        # print (img_indexs)
-        train_shuffle.append([images, targets, img_indexs])
+    # train_shuffle = []
+    # ii = len(train_data_loader)
+    # ii = 0
+    # for iteration in range(len(train_data_loader)):
+    #     if not batch_iterator:
+    #         batch_iterator = iter(train_data_loader)
+    #     # load train data
+    #     images, targets, img_indexs = next(batch_iterator)
+    #     train_shuffle.append([images, targets, img_indexs])
 
-
+    len_train = len(trainvideos)
     while iteration <= args.max_iter:
         # for i, (images, targets, img_indexs) in enumerate(train_data_loader):
-        random.shuffle(train_shuffle)
-        for i, item in enumerate(train_shuffle):
+        random.shuffle(trainvideos)
+        trainvideos_temp = trainvideos
+        train_dataset = UCF24Detection(args.data_root, 'train', SSDAugmentation(args.ssd_dim, args.means),
+                                       AnnotationTransform(),
+                                       input_type=args.modality,
+                                       videos=trainvideos_temp,
+                                       istrain=True)
+        train_data_loader = data.DataLoader(train_dataset, args.batch_size, num_workers=args.num_workers,
+                                                 shuffle=False, collate_fn=detection_collate, pin_memory=True, drop_last=True)
+
+        for i, item in enumerate(train_data_loader):
             images = item[0]
             targets = item[1]
             img_indexs = item[2]
@@ -254,6 +285,11 @@ def train(args, net, optimizer, criterion, scheduler):
             loss_l, loss_c = criterion(out, targets)
             loss = loss_l + loss_c
             loss.backward()
+            if args.clip_gradient is not None:
+                total_norm = clip_grad_norm(net.parameters(), args.clip_gradient)
+                if total_norm > args.clip_gradient:
+                    print("clipping gradient: {} with coef {}".format(total_norm, args.clip_gradient / total_norm))
+
             optimizer.step()
             scheduler.step()
             loc_loss = loss_l.data[0]
